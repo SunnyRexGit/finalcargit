@@ -18,7 +18,7 @@
 | `MotorSerial(2)` | ESP32-S3 的串口 2，用于 RS485 电机通信 | 引脚在 `RS485_RX_PIN` / `RS485_TX_PIN` |
 | `RcSerial(1)` | ESP32-S3 的串口 1，用于读取 MC7RE SBUS/M.BUS | 引脚和反相在 `RC_RX_PIN` / `RC_SERIAL_INVERTED` |
 | `pwm` | PCA9685 舵机驱动对象 | 地址在 `PCA9685_ADDRESS` |
-| `LASER_PIN` | GPIO15 激光模块控制脚 | 除 A1 底盘模式外输出高电平；CH5/CH6 中位和 failsafe 输出低电平 |
+| `LASER_PIN` | GPIO15 激光模块控制脚 | 默认常亮；B2 自动工位模式下闪烁 |
 
 ### 遥控器状态
 
@@ -36,7 +36,8 @@
 | 变量 | 作用 | 调参相关 |
 | ---- | ---- | -------- |
 | `panAngle` | S1 云台当前逻辑角度 | 初值 `SERVO_DEFAULT_S1` |
-| `armServoLogicalAngle` | S4 当前逻辑角度 | 实际写入为 `180 - armServoLogicalAngle` |
+| `armServoAngle` | S4 当前实际角度 | 代码直接写入该角度 |
+| `gripperState` | 夹爪状态变量 | `0=闭合`，`1=张开`，上电默认 `1` |
 | `gripperAngle` | S2/S3 夹爪角度 | `GRIPPER_OPEN_ANGLE` / `GRIPPER_CLOSE_ANGLE` |
 | `motor5Pos` | M5 当前目标脉冲数 | 范围 `M5_PULSE_MIN~M5_PULSE_MAX`，CH3 按住时每 `M5_UPDATE_MS` 改变一次 `M5_STEP` |
 | `motor6Pos` | M6 当前目标脉冲数 | 步长 `M6_STEP`，回中 `M6_CENTER` |
@@ -92,8 +93,8 @@
 - 什么时候被调用：ESP32 上电或复位后由 Arduino 框架调用一次。
 - 输入/输出：无参数，无返回值。
 - 会影响哪些硬件：初始化 USB 串口、遥控器串口、PCA9685、RS485 电机，并设置舵机初始角度。
-- 调参相关：启动时的舵机角度来自 `SERVO_DEFAULT_S1`、`SERVO_DEFAULT_S4_LOGICAL`、`GRIPPER_OPEN_ANGLE`。
-- 注意事项：`setupRS485Motors()` 会使能全部 M1~M6，并只给 M1~M4 清零；M5/M6 不清零。
+- 调参相关：启动时的舵机角度来自 `SERVO_DEFAULT_S1`、`SERVO_DEFAULT_S4`、`GRIPPER_OPEN_ANGLE`。
+- 注意事项：夹爪上电默认状态为 `GRIPPER_STATE_OPEN = 1`，会调用 `setGripperState()` 写入打开角度。
 
 启动顺序：
 
@@ -174,7 +175,7 @@ printDebugInfoPeriodically
 - 输入/输出：输入通道值；返回百分比速度。
 - 会影响哪些硬件：间接影响 M1~M4 底盘电机速度。
 - 调参相关：`RC_DEADZONE`、`WHEEL_CMD_MAX`。
-- 注意事项：死区内返回 0，用来避免摇杆中位抖动导致车慢慢动。
+- 注意事项：死区内返回 0；死区外按遥控器返回值线性映射，越接近 1000/2000，速度百分比越接近 -100/+100。
 
 ### `allSticksCentered()`
 
@@ -199,38 +200,47 @@ printDebugInfoPeriodically
 ### `setServoRawChannel(int pcaChannel, int angle)`
 
 - 作用：直接向 PCA9685 某个通道写入角度。
-- 什么时候被调用：`setServoLogical()` 间接调用。
+- 什么时候被调用：`setServoAngle()` 间接调用。
 - 输入/输出：输入 PCA9685 通道和实际角度；无返回值。
 - 会影响哪些硬件：对应 PCA9685 通道上的舵机。
 - 调参相关：`SERVOMIN`、`SERVOMAX`。
-- 注意事项：这是底层函数，不处理 S4 反向逻辑；平时优先调用 `setServoLogical()`。
+- 注意事项：这是底层函数；平时优先调用 `setServoAngle()`。
 
-### `setServoLogical(uint8_t servoId, int angle)`
+### `setServoAngle(uint8_t servoId, int angle)`
 
-- 作用：按 S1~S4 逻辑编号设置舵机角度。
+- 作用：按 S1~S4 编号设置舵机实际角度。
 - 什么时候被调用：启动、手动机械臂、自动工位、夹爪函数中。
-- 输入/输出：`servoId` 为 1~4，`angle` 为逻辑角度；无返回值。
+- 输入/输出：`servoId` 为 1~4，`angle` 为实际角度；无返回值。
 - 会影响哪些硬件：S1~S4 舵机。
-- 调参相关：S4 逻辑方向、舵机默认角度、自动工位角度。
-- 注意事项：S4 会自动执行 `实际角度 = 180 - 逻辑角度`；S2/S3 夹爪建议通过 `setGripperAngle()` 控制。
+- 调参相关：舵机默认角度、自动工位角度。
+- 注意事项：S4 不再反向换算，传入多少实际角度就写多少；S2/S3 夹爪建议通过 `setGripperAngle()` 控制。
 
 ### `setGripperAngle(int angle)`
 
 - 作用：同时控制 S2 和 S3 夹爪角度。
-- 什么时候被调用：启动和机械臂手动模式中。
+- 什么时候被调用：`setGripperState()` 中。
 - 输入/输出：输入夹爪角度；无返回值。
 - 会影响哪些硬件：S2/S3 夹爪舵机。
 - 调参相关：`GRIPPER_OPEN_ANGLE`、`GRIPPER_CLOSE_ANGLE`、`GRIPPER_S3_REVERSED`。
 - 注意事项：如果夹爪两个舵机需要一正一反，把 `GRIPPER_S3_REVERSED` 改为 `1`。
 
+### `setGripperState(uint8_t state)`
+
+- 作用：按夹爪状态变量控制夹爪，`0=闭合`，`1=张开`。
+- 什么时候被调用：上电初始化、B1 手动模式、B2 自动工位启动或回高位后。
+- 输入/输出：输入状态值；无返回值。
+- 会影响哪些硬件：S2/S3 夹爪舵机。
+- 调参相关：`GRIPPER_STATE_CLOSED`、`GRIPPER_STATE_OPEN`、`GRIPPER_CLOSE_ANGLE`、`GRIPPER_OPEN_ANGLE`。
+- 注意事项：状态为 1 时写入打开角度，状态为 0 时写入闭合角度；串口会打印 `GRIPPER: state=... angle=...`。
+
 ### `updateLaserForMode()`
 
-- 作用：根据当前 CH5/CH6 模式切换 GPIO15 激光输出。
+- 作用：控制 GPIO15 激光输出：默认常亮，B2 自动工位模式下闪烁。
 - 什么时候被调用：`loop()` 通过 failsafe 恢复检查后、自动状态机和模式分发前。
 - 输入/输出：无参数，无返回值。
 - 会影响哪些硬件：GPIO15 上连接的激光模块。
-- 调参相关：激光引脚在 `LASER_PIN`；模式阈值使用 `RC_OUT_MID = 1500`。
-- 注意事项：A2、B1、B2 输出高电平；A1 底盘模式输出低电平。CH5 或 CH6 在中位区间 `EDGE_CENTER_LOW~EDGE_CENTER_HIGH` 时强制输出低电平，failsafe 也会关激光。
+- 调参相关：激光引脚在 `LASER_PIN`；闪烁间隔在 `LASER_BLINK_INTERVAL_MS`；B2 判断阈值使用 `RC_OUT_MID = 1500`。
+- 注意事项：非 B2 模式保持高电平常亮；B2 自动工位模式按间隔翻转高低电平形成闪烁。
 
 ## RS485 电机函数
 
@@ -287,6 +297,7 @@ printDebugInfoPeriodically
 - 会影响哪些硬件：M1~M4 底盘电机。
 - 调参相关：`WHEEL_CMD_MAX`、`MAX_SPEED_RPM`、`MIN_EFFECTIVE_CMD`、`ACCEL_WHEEL`、`M1_SIGN~M4_SIGN`。
 - 注意事项：如果速度和上一次相同，不会重复发 RS485 命令，减少总线压力。
+  当前转速也是线性映射：`abs(cmdPercent) / WHEEL_CMD_MAX * MAX_SPEED_RPM`。
 
 ### `setMotorAbsPosition(uint8_t idx, int32_t targetPosition)`
 
@@ -369,9 +380,9 @@ m4 = vy + vx + w;
 - 作用：机械臂手动模式，控制 S1、S4、M5 和夹爪。
 - 什么时候被调用：`CH5 > 1500 && CH6 < 1500`。
 - 输入/输出：无参数，无返回值。
-- 会影响哪些硬件：S1、S2、S3、S4、M5，并先停止底盘。
-- 调参相关：`SERVO_STEP`、`SERVO_UPDATE_MS`、`M5_STEP`、`M5_UPDATE_MS`、夹爪角度。
-- 注意事项：S1/S4/夹爪按 50ms 节奏更新；M5 也按 `M5_UPDATE_MS` 连续更新，CH3 持续打到底会持续升降。
+- 会影响哪些硬件：S1、S2/S3 夹爪、S4、M5，并先停止底盘。
+- 调参相关：`SERVO_STEP`、`SERVO_UPDATE_MS`、`M5_STEP`、`M5_UPDATE_MS`、夹爪状态和角度。
+- 注意事项：CH1 左右控制 S1 云台旋转；CH4 左打到底把 `gripperState` 设为 0 闭合，CH4 右打到底设为 1 张开；CH4 回中或未触发时保持原状态。M5 按 `M5_UPDATE_MS` 连续更新。
 
 ### `updateM5ByChannel(int ch3)`
 
@@ -400,7 +411,7 @@ m4 = vy + vx + w;
 - 输入/输出：输入目标状态 `1/2/3`；无返回值。
 - 会影响哪些硬件：立即可能发送 M5 到 `HIGH_POS` 或目标位置的命令。
 - 调参相关：`HIGH_POS`、`PRE_CLAMP_*`、`TURNTABLE_*`、`PRE_DROP_*`。
-- 注意事项：如果目标状态等于当前状态，只打印提示不动作；如果已有自动流程在跑，也不会重复启动。
+- 注意事项：如果目标状态等于当前状态，只打印提示不动作；如果已有自动流程在跑，也不会重复启动。目标为转台位 State 2 或预放位 State 3 时，会在启动瞬间先把夹爪状态设为 `0=闭合`，然后再抬升 M5。目标为预夹位 State 1 时，会在 M5 回到 `HIGH_POS` 后把夹爪状态设为 `1=张开`。
 
 ### `cancelAutoMacro(bool stopMotors)`
 
@@ -447,7 +458,7 @@ M5 -> 目标高度
 - 输入/输出：输入状态 `1/2/3`；通过引用输出目标 M5/S1/S4。
 - 会影响哪些硬件：不直接控制硬件，但决定自动工位最终动作。
 - 调参相关：`PRE_CLAMP_MOTOR5`、`PRE_CLAMP_SERVO0`、`PRE_CLAMP_SERVO3`、`TURNTABLE_*`、`PRE_DROP_*`。
-- 注意事项：S4 输出的是逻辑角度，真正写舵机时仍会自动执行 `180 - angle`。
+- 注意事项：S4 输出的是实际角度，不再做 `180 - angle` 换算。
 
 ### `transitionUsesHighPos(uint8_t fromState, uint8_t toState)`
 
@@ -472,7 +483,7 @@ M5 -> 目标高度
 输出格式类似：
 
 ```text
-CH1=1500 CH2=1500 CH3=1500 CH4=1500 CH5=1000 CH6=1000 mode=DRIVE failsafe=0 auto=0 M1=0 M2=0 M3=0 M4=0 M5=0 M6=0 S1=180 S4=0 grip=90
+CH1=1500 CH2=1500 CH3=1500 CH4=1500 CH5=1000 CH6=1000 mode=DRIVE failsafe=0 auto=0 M1=0 M2=0 M3=0 M4=0 M5=0 M6=0 S1=180 S4=0 gripState=1 gripAngle=90
 ```
 
 ## 调参速查表
@@ -496,7 +507,7 @@ CH1=1500 CH2=1500 CH3=1500 CH4=1500 CH5=1000 CH6=1000 mode=DRIVE failsafe=0 auto
 | M6 回中脉冲位置不对 | 修改 `M6_CENTER` |
 | 夹爪打不开或夹不紧 | `GRIPPER_OPEN_ANGLE` / `GRIPPER_CLOSE_ANGLE` |
 | 夹爪两个舵机方向不匹配 | `GRIPPER_S3_REVERSED` |
-| S4 方向看起来不对 | 先确认机械安装，再检查 `setServoLogical()` 的 S4 反向逻辑 |
+| S4 方向看起来不对 | 先确认机械安装，再直接调整 S4 实际角度参数 |
 | 自动工位高度不对 | `PRE_CLAMP_MOTOR5`、`TURNTABLE_MOTOR5`、`PRE_DROP_MOTOR5` |
 | 自动工位 M5 太快 | 减小 `POSITION_SPEED_M5_AUTO` |
 | 自动工位角度不对 | `PRE_CLAMP_SERVO0/SERVO3`、`TURNTABLE_SERVO0/SERVO3`、`PRE_DROP_SERVO0/SERVO3` |
@@ -518,7 +529,7 @@ CH1=1500 CH2=1500 CH3=1500 CH4=1500 CH5=1000 CH6=1000 mode=DRIVE failsafe=0 auto
 
 - `idx` 是 0 索引：`idx=0` 是 M1，`idx=4` 是 M5，`idx=5` 是 M6。
 - `servoId` 是 1 索引：`servoId=1` 是 S1，`servoId=4` 是 S4。
-- S4 的 `angle` 是逻辑角度，实际写入 PCA9685 前会变成 `180 - angle`。
+- S4 的 `angle` 是实际角度，写入 PCA9685 前不再反向换算。
 - M5 的 `motor5Pos` 现在就是目标脉冲数，不再经过另一套位置单位换算。
 - M6 的 `motor6Pos` 现在也是目标脉冲数，支持正负方向，方向由 `pos >= 0` 判断。
 - `setMotorSpeed()` 有缓存，相同速度不会重复发命令。

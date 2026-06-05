@@ -1,4 +1,4 @@
-#include <Arduino.h>
+﻿#include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 
@@ -10,6 +10,7 @@ Adafruit_PWMServoDriver pwm(PCA9685_ADDRESS);
 
 const uint8_t motorAddr[6] = {1, 2, 3, 4, 5, 6};
 const int SERVO_CH[4] = {0, 1, 2, 3};
+constexpr uint8_t AUTO_STATE_CH2_LOW = 4;
 
 int rcCh[16] = {1500};
 uint16_t sbusRaw[16] = {0};
@@ -19,18 +20,25 @@ uint32_t lastRcFrameMs = 0;
 bool rcLostFlag = true;
 bool rcFailsafeFlag = true;
 bool failsafeTriggered = false;
+bool rcWasOk = false;
 
 int panAngle = SERVO_DEFAULT_S1;
-int armServoLogicalAngle = SERVO_DEFAULT_S4_LOGICAL;
+int armServoAngle = SERVO_DEFAULT_S4;
+uint8_t gripperState = GRIPPER_STATE_OPEN;
 int gripperAngle = GRIPPER_OPEN_ANGLE;
+int gripperTargetAngle = GRIPPER_OPEN_ANGLE;
 int32_t motor5Pos = M5_PULSE_MIN;
 int32_t motor6Pos = 0;
 
 int lastWheelCmd[4] = {0, 0, 0, 0};
 bool chassisStopped = false;
-uint32_t lastServoUpdateMs = 0;
-uint32_t lastM5UpdateMs = 0;
+uint32_t lastGripperUpdateMs = 0;
 uint32_t lastDebugPrintMs = 0;
+uint32_t lastLaserBlinkMs = 0;
+uint32_t laserRcConnectBlinkStartMs = 0;
+bool laserBlinkState = true;
+bool laserRcConnectBlinkActive = false;
+bool gripperMotionActive = false;
 
 struct EdgeLatch {
   bool lowArmed = true;
@@ -45,9 +53,9 @@ struct EdgeLatch {
     return false;
   }
 
-  bool high(int value) {
+  bool high(int value, int threshold = EDGE_HIGH_THRESHOLD) {
     updateCenter(value);
-    if (highArmed && value > EDGE_HIGH_THRESHOLD) {
+    if (highArmed && value > threshold) {
       highArmed = false;
       return true;
     }
@@ -64,15 +72,42 @@ struct EdgeLatch {
 
 EdgeLatch trayCh1Edge;
 EdgeLatch trayCh2Edge;
+EdgeLatch gripperCh4Edge;
 EdgeLatch autoCh1Edge;
 EdgeLatch autoCh2Edge;
+EdgeLatch autoCh3Edge;
 
 enum class AutoPhase {
   Idle,
   MoveHigh,
   MoveTarget,
   WaitServoSettle,
-  Done
+  Done,
+  TurntableMovePickup,
+  TurntableWaitBeforeClose,
+  TurntableWaitGripperClose,
+  TurntableMoveHigh,
+  TurntableWaitServoSettle,
+  TurntableMoveToTarget,
+  TurntableWaitBeforeOpen,
+  TurntableWaitGripperOpen,
+  TurntableMoveTopAfterOpen,
+  TurntableStepTray,
+  TurntableRotatePreClamp,
+  TurntableMovePreClamp,
+  PreDropMoveTopForOpen,
+  PreDropWaitGripperOpen,
+  PreDropSetS4ToTurntable,
+  PreDropSetS1ToTurntable,
+  PreDropMoveToTurntableClamp,
+  PreDropWaitGripperClose,
+  PreDropWaitAfterClose,
+  PreDropMoveTopAfterClamp,
+  PreDropSetS1ToDrop,
+  PreDropSetS4ToDrop,
+  PreDropMoveToDrop,
+  PreDropOpenAtDrop,
+  PreDropWaitOpenAtDrop
 };
 
 bool autoRunning = false;
@@ -83,6 +118,7 @@ uint32_t autoPhaseStartMs = 0;
 uint32_t autoPhaseDurationMs = 0;
 bool autoNeedsFinalMove = false;
 int32_t autoStartM5 = 0;
+int32_t autoIntermediateM5 = HIGH_POS;
 int32_t autoTargetM5 = TURNTABLE_MOTOR5;
 
 int32_t clamp32(int32_t value, int32_t low, int32_t high) {
@@ -100,6 +136,7 @@ bool readRcChannels();
 bool parseSbusFrame(const uint8_t* frame);
 int normalizeRcValue(int raw);
 int channelPercent(int value);
+int channelPercentWithMax(int value, int maxCmd);
 bool allSticksCentered();
 
 void setupPCA9685();
@@ -114,17 +151,22 @@ void emergencyStopAllMotors();
 void stopChassisOnce();
 
 void setServoRawChannel(int pcaChannel, int angle);
-void setServoLogical(uint8_t servoId, int angle);
+void setServoAngle(uint8_t servoId, int angle);
 void setGripperAngle(int angle);
+void setGripperState(uint8_t state);
+void setGripperStateSlow(uint8_t state);
+void setGripperStateFast(uint8_t state);
+void updateGripperMotion();
 
 void updateLaserForMode();
+void startLaserRcConnectBlink();
 void handleFailsafe();
 bool handleFailsafeAndRecovery();
 void handleDriveMode();
 void handleTrayMode();
-void handleArmManualMode();
+void handleChassisFineMode();
 void handleArmAutoMode();
-void updateM5ByChannel(int ch3);
+void handleGripperByChannel(int ch4);
 void startAutoState(uint8_t state);
 void cancelAutoMacro(bool stopMotors);
 void updateAutoStateMachine();
@@ -143,21 +185,27 @@ void setup() {
   Serial.println("ESP32-S3 RC car controller starting...");
 
   pinMode(LASER_PIN, OUTPUT);
-  digitalWrite(LASER_PIN, LOW);
+  digitalWrite(LASER_PIN, HIGH);
 
   setupRcReceiver();
   setupPCA9685();
   setupRS485Motors();
 
-  setServoLogical(1, panAngle);
-  setGripperAngle(gripperAngle);
-  setServoLogical(4, armServoLogicalAngle);
+  setServoAngle(1, panAngle);
+  setGripperState(gripperState);
+  setServoAngle(4, armServoAngle);
 
   Serial.println("Ready. Waiting for valid SBUS/M.BUS receiver frames.");
 }
 
 void loop() {
   const bool rcOk = readRcChannels();
+  updateGripperMotion();
+
+  if (rcOk && !rcWasOk) {
+    startLaserRcConnectBlink();
+  }
+  rcWasOk = rcOk;
 
   if (!rcOk) {
     handleFailsafe();
@@ -166,21 +214,13 @@ void loop() {
   }
 
   if (!handleFailsafeAndRecovery()) {
+    updateLaserForMode();
     printDebugInfoPeriodically();
     return;
   }
 
   updateLaserForMode();
   updateAutoStateMachine();
-
-  if (autoRunning) {
-    if (autoCh2Edge.low(channel(RC_CH2_INDEX))) {
-      cancelAutoMacro(true);
-      Serial.println("AUTO: cancelled by CH2 low");
-    }
-    printDebugInfoPeriodically();
-    return;
-  }
 
   if (channel(RC_CH5_INDEX) < RC_OUT_MID) {
     if (channel(RC_CH6_INDEX) < RC_OUT_MID) {
@@ -189,10 +229,10 @@ void loop() {
       handleTrayMode();
     }
   } else {
-    stopChassisOnce();
     if (channel(RC_CH6_INDEX) < RC_OUT_MID) {
-      handleArmManualMode();
+      handleChassisFineMode();
     } else {
+      stopChassisOnce();
       handleArmAutoMode();
     }
   }
@@ -267,12 +307,24 @@ int normalizeRcValue(int raw) {
 }
 
 int channelPercent(int value) {
+  return channelPercentWithMax(value, WHEEL_CMD_MAX);
+}
+
+int channelPercentWithMax(int value, int maxCmd) {
+  maxCmd = constrain(maxCmd, 0, WHEEL_CMD_MAX);
+  value = constrain(value, RC_OUT_MIN, RC_OUT_MAX);
   const int delta = value - RC_OUT_MID;
   if (abs(delta) <= RC_DEADZONE) return 0;
+
   if (delta > 0) {
-    return map(value, RC_OUT_MID + RC_DEADZONE, RC_OUT_MAX, 0, WHEEL_CMD_MAX);
+    const int activeRange = RC_OUT_MAX - (RC_OUT_MID + RC_DEADZONE);
+    const int activeValue = value - (RC_OUT_MID + RC_DEADZONE);
+    return constrain((int)((long)activeValue * maxCmd / activeRange), 0, maxCmd);
   }
-  return map(value, RC_OUT_MID - RC_DEADZONE, RC_OUT_MIN, 0, -WHEEL_CMD_MAX);
+
+  const int activeRange = (RC_OUT_MID - RC_DEADZONE) - RC_OUT_MIN;
+  const int activeValue = (RC_OUT_MID - RC_DEADZONE) - value;
+  return -constrain((int)((long)activeValue * maxCmd / activeRange), 0, maxCmd);
 }
 
 bool allSticksCentered() {
@@ -357,13 +409,13 @@ void setMotorSpeed(uint8_t idx, int cmdPercent) {
                     lastWheelCmd[2] == 0 && lastWheelCmd[3] == 0);
 
   uint8_t direction = (cmdPercent > 0) ? 0x01 : 0x00;
-  uint16_t speedVal = map(abs(cmdPercent), 0, WHEEL_CMD_MAX, 0, MAX_SPEED_RPM);
+  uint16_t speedVal = (uint16_t)((uint32_t)abs(cmdPercent) * CHASSIS_MAX_SPEED_RPM_LIMIT / WHEEL_CMD_MAX);
   if (cmdPercent == 0) speedVal = 0;
 
   uint8_t cmd[] = {
       motorAddr[idx], 0xF6, direction,
       (uint8_t)(speedVal >> 8), (uint8_t)(speedVal & 0xFF),
-      ACCEL_WHEEL, 0x00, 0x6B
+      CHASSIS_ACCEL_WHEEL_LIMIT, 0x00, 0x6B
   };
   sendMotorCommand(motorAddr[idx], cmd, sizeof(cmd));
 }
@@ -420,14 +472,14 @@ void setServoRawChannel(int pcaChannel, int angle) {
   pwm.setPWM(pcaChannel, 0, pulse);
 }
 
-void setServoLogical(uint8_t servoId, int angle) {
+void setServoAngle(uint8_t servoId, int angle) {
   if (servoId < 1 || servoId > 4) return;
 
-  angle = constrain(angle, 0, 180);
+  angle = (servoId == 4) ? constrain(angle, SERVO_S4_MIN, SERVO_S4_MAX)
+                         : constrain(angle, 0, 180);
   int actualAngle = angle;
   if (servoId == 4) {
-    armServoLogicalAngle = angle;
-    actualAngle = 180 - angle;
+    armServoAngle = angle;
   } else if (servoId == 1) {
     panAngle = angle;
   }
@@ -437,27 +489,125 @@ void setServoLogical(uint8_t servoId, int angle) {
 
 void setGripperAngle(int angle) {
   gripperAngle = constrain(angle, 0, 180);
-  setServoLogical(2, gripperAngle);
+  setServoAngle(2, gripperAngle);
 #if GRIPPER_S3_REVERSED
-  setServoLogical(3, 180 - gripperAngle);
+  setServoAngle(3, 180 - gripperAngle);
 #else
-  setServoLogical(3, gripperAngle);
+  setServoAngle(3, gripperAngle);
 #endif
 }
 
+void setGripperState(uint8_t state) {
+  setGripperStateSlow(state);
+}
+
+void setGripperStateSlow(uint8_t state) {
+  gripperState = (state == GRIPPER_STATE_CLOSED) ? GRIPPER_STATE_CLOSED : GRIPPER_STATE_OPEN;
+  gripperTargetAngle = (gripperState == GRIPPER_STATE_OPEN) ? GRIPPER_OPEN_ANGLE : GRIPPER_CLOSE_ANGLE;
+
+  if (gripperAngle == gripperTargetAngle) {
+    gripperMotionActive = false;
+    setGripperAngle(gripperTargetAngle);
+    Serial.printf("GRIPPER: already %s angle=%d\n",
+                  gripperState == GRIPPER_STATE_OPEN ? "open" : "closed",
+                  gripperAngle);
+    return;
+  }
+
+  gripperMotionActive = true;
+  lastGripperUpdateMs = 0;
+  Serial.printf("GRIPPER: %s stepped target=%d current=%d\n",
+                gripperState == GRIPPER_STATE_OPEN ? "open" : "close",
+                gripperTargetAngle, gripperAngle);
+}
+
+void setGripperStateFast(uint8_t state) {
+  gripperState = (state == GRIPPER_STATE_CLOSED) ? GRIPPER_STATE_CLOSED : GRIPPER_STATE_OPEN;
+  gripperTargetAngle = (gripperState == GRIPPER_STATE_OPEN) ? GRIPPER_OPEN_ANGLE : GRIPPER_CLOSE_ANGLE;
+  gripperMotionActive = false;
+  setGripperAngle(gripperTargetAngle);
+  Serial.printf("GRIPPER: %s fast angle=%d\n",
+                gripperState == GRIPPER_STATE_OPEN ? "open" : "close",
+                gripperAngle);
+}
+
+void updateGripperMotion() {
+  if (!gripperMotionActive) return;
+
+  const uint32_t now = millis();
+  const uint32_t updateMs = (gripperState == GRIPPER_STATE_OPEN)
+                                ? GRIPPER_OPEN_UPDATE_MS
+                                : GRIPPER_CLOSE_UPDATE_MS;
+  if (now - lastGripperUpdateMs < updateMs) return;
+  lastGripperUpdateMs = now;
+
+  const int delta = gripperTargetAngle - gripperAngle;
+  if (delta == 0) {
+    gripperMotionActive = false;
+    Serial.printf("GRIPPER: %s finished angle=%d\n",
+                  gripperState == GRIPPER_STATE_OPEN ? "open" : "close",
+                  gripperAngle);
+    return;
+  }
+
+  const int maxStep = (gripperState == GRIPPER_STATE_OPEN)
+                          ? GRIPPER_OPEN_STEP
+                          : GRIPPER_CLOSE_STEP;
+  const int step = min(abs(delta), maxStep);
+  setGripperAngle(gripperAngle + (delta > 0 ? step : -step));
+
+  if (gripperAngle == gripperTargetAngle) {
+    gripperMotionActive = false;
+    Serial.printf("GRIPPER: %s finished angle=%d\n",
+                  gripperState == GRIPPER_STATE_OPEN ? "open" : "close",
+                  gripperAngle);
+  }
+}
+
 void updateLaserForMode() {
+  const uint32_t now = millis();
+  if (laserRcConnectBlinkActive) {
+    if (now - laserRcConnectBlinkStartMs < LASER_RC_CONNECTED_BLINK_DURATION_MS) {
+      if (now - lastLaserBlinkMs >= LASER_RC_CONNECTED_BLINK_INTERVAL_MS) {
+        lastLaserBlinkMs = now;
+        laserBlinkState = !laserBlinkState;
+        digitalWrite(LASER_PIN, laserBlinkState ? HIGH : LOW);
+      }
+      return;
+    }
+    laserRcConnectBlinkActive = false;
+  }
+
   const int ch5 = channel(RC_CH5_INDEX);
   const int ch6 = channel(RC_CH6_INDEX);
-  const bool ch5Centered = ch5 > EDGE_CENTER_LOW && ch5 < EDGE_CENTER_HIGH;
-  const bool ch6Centered = ch6 > EDGE_CENTER_LOW && ch6 < EDGE_CENTER_HIGH;
-  const bool driveMode = ch5 < RC_OUT_MID && ch6 < RC_OUT_MID;
-  const bool laserOn = !driveMode && !ch5Centered && !ch6Centered;
-  digitalWrite(LASER_PIN, laserOn ? HIGH : LOW);
+  const bool autoMode = ch5 >= RC_OUT_MID && ch6 >= RC_OUT_MID;
+  const uint32_t blinkIntervalMs = autoRunning ? LASER_AUTO_RUNNING_BLINK_INTERVAL_MS
+                                               : LASER_BLINK_INTERVAL_MS;
+
+  if (!autoMode) {
+    laserBlinkState = true;
+    digitalWrite(LASER_PIN, HIGH);
+    return;
+  }
+
+  if (now - lastLaserBlinkMs >= blinkIntervalMs) {
+    lastLaserBlinkMs = now;
+    laserBlinkState = !laserBlinkState;
+    digitalWrite(LASER_PIN, laserBlinkState ? HIGH : LOW);
+  }
+}
+
+void startLaserRcConnectBlink() {
+  laserRcConnectBlinkStartMs = millis();
+  laserRcConnectBlinkActive = true;
+  lastLaserBlinkMs = 0;
+  laserBlinkState = false;
+  Serial.println("RC connected: laser fast blink for 3 seconds");
 }
 
 void handleFailsafe() {
   if (!failsafeTriggered) {
-    digitalWrite(LASER_PIN, LOW);
+    digitalWrite(LASER_PIN, HIGH);
     emergencyStopAllMotors();
     cancelAutoMacro(false);
     failsafeTriggered = true;
@@ -521,60 +671,50 @@ void handleTrayMode() {
   }
 }
 
-void handleArmManualMode() {
-  stopChassisOnce();
+void handleChassisFineMode() {
+  int vx = channelPercentWithMax(channel(RC_CH1_INDEX), FINE_WHEEL_CMD_MAX) * CHASSIS_X_SIGN;
+  int vy = channelPercentWithMax(channel(RC_CH2_INDEX), FINE_WHEEL_CMD_MAX) * CHASSIS_Y_SIGN;
+  int w = channelPercentWithMax(channel(RC_CH4_INDEX), FINE_WHEEL_CMD_MAX) * CHASSIS_W_SIGN;
 
-  const uint32_t now = millis();
-  if (now - lastServoUpdateMs >= SERVO_UPDATE_MS) {
-    lastServoUpdateMs = now;
+  int m[4] = {
+      (vy - vx + w) * M1_SIGN,
+      (-vy + vx + w) * M2_SIGN,
+      (-vy - vx + w) * M3_SIGN,
+      (vy + vx + w) * M4_SIGN
+  };
 
-    const int ch1 = channel(RC_CH1_INDEX);
-    const int ch2 = channel(RC_CH2_INDEX);
-    if (ch1 < EDGE_LOW_THRESHOLD) {
-      setServoLogical(1, panAngle - SERVO_STEP);
-    } else if (ch1 > EDGE_HIGH_THRESHOLD) {
-      setServoLogical(1, panAngle + SERVO_STEP);
-    }
-
-    if (ch2 > EDGE_HIGH_THRESHOLD) {
-      setServoLogical(4, armServoLogicalAngle + SERVO_STEP);
-    } else if (ch2 < EDGE_LOW_THRESHOLD) {
-      setServoLogical(4, armServoLogicalAngle - SERVO_STEP);
-    }
-
-    const int ch4 = channel(RC_CH4_INDEX);
-    if (abs(ch4 - RC_OUT_MID) > RC_DEADZONE) {
-      int angle = map(ch4, RC_OUT_MIN, RC_OUT_MAX, GRIPPER_CLOSE_ANGLE, GRIPPER_OPEN_ANGLE);
-      setGripperAngle(constrain(angle, min(GRIPPER_OPEN_ANGLE, GRIPPER_CLOSE_ANGLE),
-                                max(GRIPPER_OPEN_ANGLE, GRIPPER_CLOSE_ANGLE)));
+  int maxAbs = 1;
+  for (uint8_t i = 0; i < 4; i++) {
+    maxAbs = max(maxAbs, abs(m[i]));
+  }
+  if (maxAbs > FINE_WHEEL_CMD_MAX) {
+    for (uint8_t i = 0; i < 4; i++) {
+      m[i] = (long)m[i] * FINE_WHEEL_CMD_MAX / maxAbs;
     }
   }
 
-  updateM5ByChannel(channel(RC_CH3_INDEX));
+  for (uint8_t i = 0; i < 4; i++) {
+    setMotorSpeed(i, m[i]);
+  }
 }
 
-void updateM5ByChannel(int ch3) {
-  const uint32_t now = millis();
-  if (now - lastM5UpdateMs < M5_UPDATE_MS) return;
-
-  if (ch3 > EDGE_HIGH_THRESHOLD) {
-    lastM5UpdateMs = now;
-    setMotorAbsPosition(4, motor5Pos - (M5_STEP * M5_DIR_SIGN));
-  } else if (ch3 < EDGE_LOW_THRESHOLD) {
-    lastM5UpdateMs = now;
-    setMotorAbsPosition(4, motor5Pos + (M5_STEP * M5_DIR_SIGN));
+void handleGripperByChannel(int ch4) {
+  if (gripperCh4Edge.low(ch4)) {
+    setGripperState(GRIPPER_STATE_CLOSED);
+  } else if (gripperCh4Edge.high(ch4)) {
+    setGripperState(GRIPPER_STATE_OPEN);
   }
 }
 
 void handleArmAutoMode() {
   stopChassisOnce();
+  handleGripperByChannel(channel(RC_CH4_INDEX));
 
-  if (autoCh2Edge.low(channel(RC_CH2_INDEX))) {
-    cancelAutoMacro(true);
-    Serial.println("AUTO: emergency cancel");
+  if (autoCh3Edge.high(channel(RC_CH3_INDEX), AUTO_CH3_TOP_THRESHOLD)) {
+    Serial.printf("AUTO_STEP: CH3 top -> move M5 to top pos %ld\n", (long)M5_TOP_MOTOR5);
+    setMotorAbsPosition(4, M5_TOP_MOTOR5, POSITION_SPEED_M5_AUTO);
     return;
   }
-  if (autoRunning) return;
 
   if (autoCh1Edge.low(channel(RC_CH1_INDEX))) {
     startAutoState(1);
@@ -586,11 +726,7 @@ void handleArmAutoMode() {
 }
 
 void startAutoState(uint8_t state) {
-  if (state < 1 || state > 3 || autoRunning) return;
-  if (state == currentAutoState) {
-    Serial.printf("AUTO: already at state %u\n", state);
-    return;
-  }
+  if (state < 1 || state > AUTO_STATE_CH2_LOW) return;
 
   targetAutoState = state;
   int targetS1 = 0;
@@ -601,15 +737,32 @@ void startAutoState(uint8_t state) {
   autoRunning = true;
   autoNeedsFinalMove = useHigh;
   autoStartM5 = motor5Pos;
+  autoIntermediateM5 = (targetAutoState == AUTO_STATE_CH2_LOW) ? CH2_LOW_AUTO_LIFT_MOTOR5 : HIGH_POS;
   autoPhaseStartMs = millis();
 
   Serial.printf("AUTO: start state %u -> state %u\n", currentAutoState, targetAutoState);
 
+  if (targetAutoState == 2) {
+    Serial.printf("AUTO_STEP: move M5 to pickup pos %ld\n", (long)PICKUP_MOTOR5);
+    setMotorAbsPosition(4, PICKUP_MOTOR5, POSITION_SPEED_M5_AUTO);
+    autoPhase = AutoPhase::TurntableMovePickup;
+    autoPhaseDurationMs = estimateMotor5MoveTime(autoStartM5, PICKUP_MOTOR5);
+    return;
+  }
+
+  if (targetAutoState == 3) {
+    Serial.printf("AUTO_STEP: move M5 to top pos %ld\n", (long)M5_TOP_MOTOR5);
+    setMotorAbsPosition(4, M5_TOP_MOTOR5, POSITION_SPEED_M5_AUTO);
+    autoPhase = AutoPhase::PreDropMoveTopForOpen;
+    autoPhaseDurationMs = estimateMotor5MoveTime(autoStartM5, M5_TOP_MOTOR5);
+    return;
+  }
+
   if (useHigh) {
-    Serial.println("AUTO_STEP: move M5 to HIGH_POS");
-    setMotorAbsPosition(4, HIGH_POS, POSITION_SPEED_M5_AUTO);
+    Serial.printf("AUTO_STEP: move M5 to lift pos %ld\n", (long)autoIntermediateM5);
+    setMotorAbsPosition(4, autoIntermediateM5, POSITION_SPEED_M5_AUTO);
     autoPhase = AutoPhase::MoveHigh;
-    autoPhaseDurationMs = estimateMotor5MoveTime(autoStartM5, HIGH_POS);
+    autoPhaseDurationMs = estimateMotor5MoveTime(autoStartM5, autoIntermediateM5);
   } else {
     Serial.println("AUTO_STEP: move M5 to target");
     setMotorAbsPosition(4, autoTargetM5, POSITION_SPEED_M5_AUTO);
@@ -641,8 +794,8 @@ void updateAutoStateMachine() {
     case AutoPhase::MoveHigh:
     case AutoPhase::MoveTarget:
       Serial.println("AUTO_STEP: move servos");
-      setServoLogical(1, targetS1);
-      setServoLogical(4, targetS4);
+      setServoAngle(1, targetS1);
+      setServoAngle(4, targetS4);
       autoPhase = AutoPhase::WaitServoSettle;
       autoPhaseStartMs = now;
       autoPhaseDurationMs = AUTO_SERVO_SETTLE_MS;
@@ -654,7 +807,7 @@ void updateAutoStateMachine() {
         setMotorAbsPosition(4, autoTargetM5, POSITION_SPEED_M5_AUTO);
         autoPhase = AutoPhase::Done;
         autoPhaseStartMs = now;
-        autoPhaseDurationMs = estimateMotor5MoveTime(HIGH_POS, autoTargetM5);
+        autoPhaseDurationMs = estimateMotor5MoveTime(autoIntermediateM5, autoTargetM5);
       } else {
         currentAutoState = targetAutoState;
         autoRunning = false;
@@ -668,6 +821,226 @@ void updateAutoStateMachine() {
       autoRunning = false;
       autoPhase = AutoPhase::Idle;
       Serial.println("AUTO: finished");
+      break;
+
+    case AutoPhase::TurntableMovePickup:
+      Serial.println("AUTO_STEP: wait before close gripper");
+      autoPhase = AutoPhase::TurntableWaitBeforeClose;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = AUTO_GRIPPER_SETTLE_MS;
+      break;
+
+    case AutoPhase::TurntableWaitBeforeClose:
+      Serial.println("AUTO_STEP: close gripper");
+      setGripperStateFast(GRIPPER_STATE_CLOSED);
+      autoPhase = AutoPhase::TurntableWaitGripperClose;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = 0;
+      break;
+
+    case AutoPhase::TurntableWaitGripperClose:
+      if (gripperMotionActive) {
+        autoPhaseStartMs = now;
+        autoPhaseDurationMs = GRIPPER_CLOSE_UPDATE_MS;
+        break;
+      }
+      Serial.printf("AUTO_STEP: move M5 to lift pos %ld\n", (long)HIGH_POS);
+      setMotorAbsPosition(4, HIGH_POS, POSITION_SPEED_M5_AUTO);
+      autoPhase = AutoPhase::TurntableMoveHigh;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = estimateMotor5MoveTime(PICKUP_MOTOR5, HIGH_POS);
+      break;
+
+    case AutoPhase::TurntableMoveHigh:
+      Serial.println("AUTO_STEP: move servos to turntable");
+      setServoAngle(1, targetS1);
+      setServoAngle(4, targetS4);
+      autoPhase = AutoPhase::TurntableWaitServoSettle;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = AUTO_SERVO_SETTLE_MS;
+      break;
+
+    case AutoPhase::TurntableWaitServoSettle:
+      Serial.printf("AUTO_STEP: move M5 to turntable pos %ld\n", (long)TURNTABLE_MOTOR5);
+      setMotorAbsPosition(4, TURNTABLE_MOTOR5, POSITION_SPEED_M5_AUTO);
+      autoPhase = AutoPhase::TurntableMoveToTarget;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = estimateMotor5MoveTime(HIGH_POS, TURNTABLE_MOTOR5);
+      break;
+
+    case AutoPhase::TurntableMoveToTarget:
+      Serial.println("AUTO_STEP: wait before open gripper");
+      autoPhase = AutoPhase::TurntableWaitBeforeOpen;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = AUTO_GRIPPER_SETTLE_MS;
+      break;
+
+    case AutoPhase::TurntableWaitBeforeOpen:
+      Serial.println("AUTO_STEP: open gripper");
+      setGripperStateFast(GRIPPER_STATE_OPEN);
+      autoPhase = AutoPhase::TurntableWaitGripperOpen;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = 0;
+      break;
+
+    case AutoPhase::TurntableWaitGripperOpen:
+      if (gripperMotionActive) {
+        autoPhaseStartMs = now;
+        autoPhaseDurationMs = GRIPPER_OPEN_UPDATE_MS;
+        break;
+      }
+      Serial.printf("AUTO_STEP: move M5 to top pos %ld\n", (long)M5_TOP_MOTOR5);
+      setMotorAbsPosition(4, M5_TOP_MOTOR5, POSITION_SPEED_M5_AUTO);
+      autoPhase = AutoPhase::TurntableMoveTopAfterOpen;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = estimateMotor5MoveTime(TURNTABLE_MOTOR5, M5_TOP_MOTOR5);
+      break;
+
+    case AutoPhase::TurntableMoveTopAfterOpen:
+      Serial.printf("AUTO_STEP: step M6 tray to %ld\n", (long)(motor6Pos + AUTO_TURNTABLE_M6_STEP));
+      setMotorAbsPosition(5, motor6Pos + AUTO_TURNTABLE_M6_STEP);
+      autoPhase = AutoPhase::TurntableStepTray;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = AUTO_M6_STEP_WAIT_MS;
+      break;
+
+    case AutoPhase::TurntableStepTray:
+      Serial.println("AUTO_STEP: rotate S1 to pre-clamp and push S4 to limit");
+      setServoAngle(1, PRE_CLAMP_SERVO0);
+      setServoAngle(4, PRE_DROP_SERVO3);
+      autoPhase = AutoPhase::TurntableRotatePreClamp;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = AUTO_SERVO_SETTLE_MS;
+      break;
+
+    case AutoPhase::TurntableRotatePreClamp:
+      Serial.printf("AUTO_STEP: move M5 to pre-clamp pos %ld\n", (long)PRE_CLAMP_MOTOR5);
+      setMotorAbsPosition(4, PRE_CLAMP_MOTOR5, POSITION_SPEED_M5_AUTO);
+      autoPhase = AutoPhase::TurntableMovePreClamp;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = estimateMotor5MoveTime(M5_TOP_MOTOR5, PRE_CLAMP_MOTOR5);
+      break;
+
+    case AutoPhase::TurntableMovePreClamp:
+      currentAutoState = 1;
+      autoRunning = false;
+      autoPhase = AutoPhase::Idle;
+      Serial.println("AUTO: turntable macro finished at pre-clamp");
+      break;
+
+    case AutoPhase::PreDropMoveTopForOpen:
+      Serial.println("AUTO_STEP: confirm gripper open");
+      setGripperStateFast(GRIPPER_STATE_OPEN);
+      autoPhase = AutoPhase::PreDropWaitGripperOpen;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = 0;
+      break;
+
+    case AutoPhase::PreDropWaitGripperOpen:
+      if (gripperMotionActive) {
+        autoPhaseStartMs = now;
+        autoPhaseDurationMs = GRIPPER_OPEN_UPDATE_MS;
+        break;
+      }
+      Serial.printf("AUTO_STEP: set S4 inward to turntable angle %d\n", TURNTABLE_SERVO3);
+      setServoAngle(4, TURNTABLE_SERVO3);
+      autoPhase = AutoPhase::PreDropSetS4ToTurntable;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = AUTO_SERVO_SETTLE_MS;
+      break;
+
+    case AutoPhase::PreDropSetS4ToTurntable:
+      Serial.printf("AUTO_STEP: set S1 to turntable angle %d\n", TURNTABLE_SERVO0);
+      setServoAngle(1, TURNTABLE_SERVO0);
+      autoPhase = AutoPhase::PreDropSetS1ToTurntable;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = PRE_DROP_S1_TO_CLAMP_SETTLE_MS;
+      break;
+
+    case AutoPhase::PreDropSetS1ToTurntable:
+      Serial.printf("AUTO_STEP: move M5 to turntable clamp pos %ld\n", (long)CH2_LOW_AUTO_TARGET_MOTOR5);
+      setMotorAbsPosition(4, CH2_LOW_AUTO_TARGET_MOTOR5, POSITION_SPEED_M5_AUTO);
+      autoPhase = AutoPhase::PreDropMoveToTurntableClamp;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = PRE_DROP_M5_CLAMP_BEFORE_CLOSE_MS;
+      break;
+
+    case AutoPhase::PreDropMoveToTurntableClamp:
+      Serial.println("AUTO_STEP: close gripper");
+      setGripperStateFast(GRIPPER_STATE_CLOSED);
+      autoPhase = AutoPhase::PreDropWaitGripperClose;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = 0;
+      break;
+
+    case AutoPhase::PreDropWaitGripperClose:
+      if (gripperMotionActive) {
+        autoPhaseStartMs = now;
+        autoPhaseDurationMs = GRIPPER_CLOSE_UPDATE_MS;
+        break;
+      }
+      Serial.println("AUTO_STEP: wait after close gripper");
+      autoPhase = AutoPhase::PreDropWaitAfterClose;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = PRE_DROP_AFTER_CLOSE_WAIT_MS;
+      break;
+
+    case AutoPhase::PreDropWaitAfterClose:
+      Serial.printf("AUTO_STEP: move M5 to top pos %ld\n", (long)M5_TOP_MOTOR5);
+      setMotorAbsPosition(4, M5_TOP_MOTOR5, POSITION_SPEED_M5_AUTO);
+      autoPhase = AutoPhase::PreDropMoveTopAfterClamp;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = estimateMotor5MoveTime(CH2_LOW_AUTO_TARGET_MOTOR5, M5_TOP_MOTOR5);
+      break;
+
+    case AutoPhase::PreDropMoveTopAfterClamp:
+      Serial.printf("AUTO_STEP: set S1 to pre-drop angle %d\n", PRE_DROP_SERVO0);
+      setServoAngle(1, PRE_DROP_SERVO0);
+      autoPhase = AutoPhase::PreDropSetS1ToDrop;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = AUTO_SERVO_SETTLE_MS;
+      break;
+
+    case AutoPhase::PreDropSetS1ToDrop:
+      Serial.printf("AUTO_STEP: set S4 outward to pre-drop angle %d\n", PRE_DROP_SERVO3);
+      setServoAngle(4, PRE_DROP_SERVO3);
+      autoPhase = AutoPhase::PreDropSetS4ToDrop;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = AUTO_SERVO_SETTLE_MS;
+      break;
+
+    case AutoPhase::PreDropSetS4ToDrop:
+      Serial.printf("AUTO_STEP: move M5 to pre-drop pos %ld\n", (long)PRE_DROP_MOTOR5);
+      setMotorAbsPosition(4, PRE_DROP_MOTOR5, POSITION_SPEED_M5_AUTO);
+      autoPhase = AutoPhase::PreDropMoveToDrop;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = estimateMotor5MoveTime(M5_TOP_MOTOR5, PRE_DROP_MOTOR5);
+      break;
+
+    case AutoPhase::PreDropMoveToDrop:
+      Serial.println("AUTO_STEP: slow open gripper at pre-drop");
+      setGripperStateSlow(GRIPPER_STATE_OPEN);
+      autoPhase = AutoPhase::PreDropOpenAtDrop;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = 0;
+      break;
+
+    case AutoPhase::PreDropOpenAtDrop:
+      if (gripperMotionActive) {
+        autoPhaseStartMs = now;
+        autoPhaseDurationMs = GRIPPER_OPEN_UPDATE_MS;
+        break;
+      }
+      autoPhase = AutoPhase::PreDropWaitOpenAtDrop;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = 0;
+      break;
+
+    case AutoPhase::PreDropWaitOpenAtDrop:
+      currentAutoState = 3;
+      autoRunning = false;
+      autoPhase = AutoPhase::Idle;
+      Serial.println("AUTO: pre-drop merged macro finished");
       break;
 
     case AutoPhase::Idle:
@@ -685,15 +1058,19 @@ void getAutoTargets(uint8_t state, int32_t& m5, int& s1, int& s4) {
   if (state == 1) {
     m5 = PRE_CLAMP_MOTOR5;
     s1 = PRE_CLAMP_SERVO0;
-    s4 = PRE_CLAMP_SERVO3;
+    s4 = AUTO_PRE_CLAMP_S4_AFTER_LIFT;
   } else if (state == 2) {
     m5 = TURNTABLE_MOTOR5;
     s1 = TURNTABLE_SERVO0;
-    s4 = TURNTABLE_SERVO3;
-  } else {
+    s4 = AUTO_TURNTABLE_S4_AFTER_LIFT;
+  } else if (state == 3) {
     m5 = PRE_DROP_MOTOR5;
     s1 = PRE_DROP_SERVO0;
-    s4 = PRE_DROP_SERVO3;
+    s4 = AUTO_PRE_DROP_S4_AFTER_LIFT;
+  } else {
+    m5 = CH2_LOW_AUTO_TARGET_MOTOR5;
+    s1 = TURNTABLE_SERVO0;
+    s4 = AUTO_TURNTABLE_S4_AFTER_LIFT;
   }
 }
 
@@ -710,13 +1087,14 @@ void printDebugInfoPeriodically() {
 
   const char* mode = "DRIVE";
   if (channel(RC_CH5_INDEX) < RC_OUT_MID && channel(RC_CH6_INDEX) >= RC_OUT_MID) mode = "TRAY";
-  if (channel(RC_CH5_INDEX) >= RC_OUT_MID && channel(RC_CH6_INDEX) < RC_OUT_MID) mode = "ARM";
+  if (channel(RC_CH5_INDEX) >= RC_OUT_MID && channel(RC_CH6_INDEX) < RC_OUT_MID) mode = "FINE";
   if (channel(RC_CH5_INDEX) >= RC_OUT_MID && channel(RC_CH6_INDEX) >= RC_OUT_MID) mode = "AUTO";
 
-  Serial.printf("CH1=%d CH2=%d CH3=%d CH4=%d CH5=%d CH6=%d mode=%s failsafe=%d auto=%d M1=%d M2=%d M3=%d M4=%d M5=%ld M6=%ld S1=%d S4=%d grip=%d\n",
+  Serial.printf("CH1=%d CH2=%d CH3=%d CH4=%d CH5=%d CH6=%d mode=%s failsafe=%d auto=%d M1=%d M2=%d M3=%d M4=%d M5=%ld M6=%ld S1=%d S4=%d gripState=%u gripAngle=%d\n",
                 channel(RC_CH1_INDEX), channel(RC_CH2_INDEX), channel(RC_CH3_INDEX),
                 channel(RC_CH4_INDEX), channel(RC_CH5_INDEX), channel(RC_CH6_INDEX),
                 mode, failsafeTriggered || rcFailsafeFlag || rcLostFlag, autoRunning,
                 lastWheelCmd[0], lastWheelCmd[1], lastWheelCmd[2], lastWheelCmd[3],
-                (long)motor5Pos, (long)motor6Pos, panAngle, armServoLogicalAngle, gripperAngle);
+                (long)motor5Pos, (long)motor6Pos, panAngle, armServoAngle, gripperState, gripperAngle);
 }
+
