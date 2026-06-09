@@ -36,14 +36,6 @@ constexpr int AUTO_PRE_CLAMP_S4_AFTER_LIFT = 80;
 constexpr int AUTO_TURNTABLE_S4_AFTER_LIFT = 170;
 constexpr int AUTO_PRE_DROP_S4_AFTER_LIFT = 80;
 
-// Gripper S2/S3 speed control.
-constexpr uint32_t GRIPPER_OPEN_UPDATE_MS = 50;
-constexpr int GRIPPER_OPEN_STEP = 3;
-
-// 夹爪闭合也分步执行，但比张开更快；太猛就减小步长或增大周期。
-constexpr uint32_t GRIPPER_CLOSE_UPDATE_MS = 50;
-constexpr int GRIPPER_CLOSE_STEP = 5;
-
 // ==================== MC7RE / SBUS 遥控器输入 ====================
 
 // 遥控接收机串口输入引脚，MC7RE 的 M.BUS/SBUS 信号线接 GPIO18。
@@ -236,6 +228,9 @@ constexpr int SERVO_STEP = 5;
 // 夹爪打开角度，S2/S3 默认都写这个角度。
 constexpr int GRIPPER_OPEN_ANGLE = 60;
 
+// 转台放料时的临时半开角度，先松到 120，再在回顶后完全打开到 60。
+constexpr int GRIPPER_TURNTABLE_RELEASE_ANGLE = 120;
+
 // 夹爪闭合角度，S2/S3 默认都写这个角度。
 constexpr int GRIPPER_CLOSE_ANGLE = 170;
 
@@ -303,8 +298,17 @@ constexpr uint32_t AUTO_SERVO_SETTLE_MS = 500;
 // 自动工位中夹爪开合前后的固定等待时间。
 constexpr uint32_t AUTO_GRIPPER_SETTLE_MS = 500;
 
+// State 2 转台连贯宏：M5 到夹取位后的等待时间。
+constexpr uint32_t TURNTABLE_PICKUP_MOVE_WAIT_MS = 2000;
+
+// State 2 转台连贯宏：M5 到转台位后的等待时间。
+constexpr uint32_t TURNTABLE_TO_TARGET_MOVE_WAIT_MS = 2000;
+
+// State 3 合并预放宏：S4 内收到转台角后的等待时间。
+constexpr uint32_t PRE_DROP_S4_TO_TURNTABLE_SETTLE_MS = 200;
+
 // CH1 右推合并预放宏：S1 到转盘角度后，到启动 M5 下探之间的等待时间。
-constexpr uint32_t PRE_DROP_S1_TO_CLAMP_SETTLE_MS = 200;
+constexpr uint32_t PRE_DROP_S1_TO_CLAMP_SETTLE_MS = 1000;
 
 // CH1 右推合并预放宏：M5 开始去转盘预夹位后，提前启动夹爪闭合的等待时间。
 // 该值小于 AUTO_M5_MOVE_WAIT_MS 时，夹爪会在 M5 仍在接近 42000 的过程中提前闭合。

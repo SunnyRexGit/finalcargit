@@ -32,13 +32,11 @@ int32_t motor6Pos = 0;
 
 int lastWheelCmd[4] = {0, 0, 0, 0};
 bool chassisStopped = false;
-uint32_t lastGripperUpdateMs = 0;
 uint32_t lastDebugPrintMs = 0;
 uint32_t lastLaserBlinkMs = 0;
 uint32_t laserRcConnectBlinkStartMs = 0;
 bool laserBlinkState = true;
 bool laserRcConnectBlinkActive = false;
-bool gripperMotionActive = false;
 
 struct EdgeLatch {
   bool lowArmed = true;
@@ -89,12 +87,12 @@ enum class AutoPhase {
   TurntableMoveHigh,
   TurntableWaitServoSettle,
   TurntableMoveToTarget,
-  TurntableWaitBeforeOpen,
   TurntableWaitGripperOpen,
   TurntableMoveTopAfterOpen,
   TurntableStepTray,
   TurntableRotatePreClamp,
   TurntableMovePreClamp,
+  TurntableFinishPreClamp,
   PreDropMoveTopForOpen,
   PreDropWaitGripperOpen,
   PreDropSetS4ToTurntable,
@@ -104,10 +102,9 @@ enum class AutoPhase {
   PreDropWaitAfterClose,
   PreDropMoveTopAfterClamp,
   PreDropSetS1ToDrop,
+  PreDropReverseTray,
   PreDropSetS4ToDrop,
   PreDropMoveToDrop,
-  PreDropOpenAtDrop,
-  PreDropWaitOpenAtDrop
 };
 
 bool autoRunning = false;
@@ -154,9 +151,8 @@ void setServoRawChannel(int pcaChannel, int angle);
 void setServoAngle(uint8_t servoId, int angle);
 void setGripperAngle(int angle);
 void setGripperState(uint8_t state);
-void setGripperStateSlow(uint8_t state);
 void setGripperStateFast(uint8_t state);
-void updateGripperMotion();
+void setGripperReleaseAngleFast(int angle);
 
 void updateLaserForMode();
 void startLaserRcConnectBlink();
@@ -192,7 +188,7 @@ void setup() {
   setupRS485Motors();
 
   setServoAngle(1, panAngle);
-  setGripperState(gripperState);
+  setGripperStateFast(gripperState);
   setServoAngle(4, armServoAngle);
 
   Serial.println("Ready. Waiting for valid SBUS/M.BUS receiver frames.");
@@ -200,7 +196,6 @@ void setup() {
 
 void loop() {
   const bool rcOk = readRcChannels();
-  updateGripperMotion();
 
   if (rcOk && !rcWasOk) {
     startLaserRcConnectBlink();
@@ -498,70 +493,23 @@ void setGripperAngle(int angle) {
 }
 
 void setGripperState(uint8_t state) {
-  setGripperStateSlow(state);
-}
-
-void setGripperStateSlow(uint8_t state) {
-  gripperState = (state == GRIPPER_STATE_CLOSED) ? GRIPPER_STATE_CLOSED : GRIPPER_STATE_OPEN;
-  gripperTargetAngle = (gripperState == GRIPPER_STATE_OPEN) ? GRIPPER_OPEN_ANGLE : GRIPPER_CLOSE_ANGLE;
-
-  if (gripperAngle == gripperTargetAngle) {
-    gripperMotionActive = false;
-    setGripperAngle(gripperTargetAngle);
-    Serial.printf("GRIPPER: already %s angle=%d\n",
-                  gripperState == GRIPPER_STATE_OPEN ? "open" : "closed",
-                  gripperAngle);
-    return;
-  }
-
-  gripperMotionActive = true;
-  lastGripperUpdateMs = 0;
-  Serial.printf("GRIPPER: %s stepped target=%d current=%d\n",
-                gripperState == GRIPPER_STATE_OPEN ? "open" : "close",
-                gripperTargetAngle, gripperAngle);
+  setGripperStateFast(state);
 }
 
 void setGripperStateFast(uint8_t state) {
   gripperState = (state == GRIPPER_STATE_CLOSED) ? GRIPPER_STATE_CLOSED : GRIPPER_STATE_OPEN;
   gripperTargetAngle = (gripperState == GRIPPER_STATE_OPEN) ? GRIPPER_OPEN_ANGLE : GRIPPER_CLOSE_ANGLE;
-  gripperMotionActive = false;
   setGripperAngle(gripperTargetAngle);
   Serial.printf("GRIPPER: %s fast angle=%d\n",
                 gripperState == GRIPPER_STATE_OPEN ? "open" : "close",
                 gripperAngle);
 }
 
-void updateGripperMotion() {
-  if (!gripperMotionActive) return;
-
-  const uint32_t now = millis();
-  const uint32_t updateMs = (gripperState == GRIPPER_STATE_OPEN)
-                                ? GRIPPER_OPEN_UPDATE_MS
-                                : GRIPPER_CLOSE_UPDATE_MS;
-  if (now - lastGripperUpdateMs < updateMs) return;
-  lastGripperUpdateMs = now;
-
-  const int delta = gripperTargetAngle - gripperAngle;
-  if (delta == 0) {
-    gripperMotionActive = false;
-    Serial.printf("GRIPPER: %s finished angle=%d\n",
-                  gripperState == GRIPPER_STATE_OPEN ? "open" : "close",
-                  gripperAngle);
-    return;
-  }
-
-  const int maxStep = (gripperState == GRIPPER_STATE_OPEN)
-                          ? GRIPPER_OPEN_STEP
-                          : GRIPPER_CLOSE_STEP;
-  const int step = min(abs(delta), maxStep);
-  setGripperAngle(gripperAngle + (delta > 0 ? step : -step));
-
-  if (gripperAngle == gripperTargetAngle) {
-    gripperMotionActive = false;
-    Serial.printf("GRIPPER: %s finished angle=%d\n",
-                  gripperState == GRIPPER_STATE_OPEN ? "open" : "close",
-                  gripperAngle);
-  }
+void setGripperReleaseAngleFast(int angle) {
+  gripperState = GRIPPER_STATE_OPEN;
+  gripperTargetAngle = constrain(angle, 0, 180);
+  setGripperAngle(gripperTargetAngle);
+  Serial.printf("GRIPPER: release angle=%d\n", gripperAngle);
 }
 
 void updateLaserForMode() {
@@ -700,9 +648,9 @@ void handleChassisFineMode() {
 
 void handleGripperByChannel(int ch4) {
   if (gripperCh4Edge.low(ch4)) {
-    setGripperState(GRIPPER_STATE_CLOSED);
+    setGripperStateFast(GRIPPER_STATE_CLOSED);
   } else if (gripperCh4Edge.high(ch4)) {
-    setGripperState(GRIPPER_STATE_OPEN);
+    setGripperStateFast(GRIPPER_STATE_OPEN);
   }
 }
 
@@ -746,7 +694,7 @@ void startAutoState(uint8_t state) {
     Serial.printf("AUTO_STEP: move M5 to pickup pos %ld\n", (long)PICKUP_MOTOR5);
     setMotorAbsPosition(4, PICKUP_MOTOR5, POSITION_SPEED_M5_AUTO);
     autoPhase = AutoPhase::TurntableMovePickup;
-    autoPhaseDurationMs = estimateMotor5MoveTime(autoStartM5, PICKUP_MOTOR5);
+    autoPhaseDurationMs = TURNTABLE_PICKUP_MOVE_WAIT_MS;
     return;
   }
 
@@ -839,11 +787,6 @@ void updateAutoStateMachine() {
       break;
 
     case AutoPhase::TurntableWaitGripperClose:
-      if (gripperMotionActive) {
-        autoPhaseStartMs = now;
-        autoPhaseDurationMs = GRIPPER_CLOSE_UPDATE_MS;
-        break;
-      }
       Serial.printf("AUTO_STEP: move M5 to lift pos %ld\n", (long)HIGH_POS);
       setMotorAbsPosition(4, HIGH_POS, POSITION_SPEED_M5_AUTO);
       autoPhase = AutoPhase::TurntableMoveHigh;
@@ -865,30 +808,18 @@ void updateAutoStateMachine() {
       setMotorAbsPosition(4, TURNTABLE_MOTOR5, POSITION_SPEED_M5_AUTO);
       autoPhase = AutoPhase::TurntableMoveToTarget;
       autoPhaseStartMs = now;
-      autoPhaseDurationMs = estimateMotor5MoveTime(HIGH_POS, TURNTABLE_MOTOR5);
+      autoPhaseDurationMs = TURNTABLE_TO_TARGET_MOVE_WAIT_MS;
       break;
 
     case AutoPhase::TurntableMoveToTarget:
-      Serial.println("AUTO_STEP: wait before open gripper");
-      autoPhase = AutoPhase::TurntableWaitBeforeOpen;
-      autoPhaseStartMs = now;
-      autoPhaseDurationMs = AUTO_GRIPPER_SETTLE_MS;
-      break;
-
-    case AutoPhase::TurntableWaitBeforeOpen:
-      Serial.println("AUTO_STEP: open gripper");
-      setGripperStateFast(GRIPPER_STATE_OPEN);
+      Serial.printf("AUTO_STEP: release gripper to angle %d\n", GRIPPER_TURNTABLE_RELEASE_ANGLE);
+      setGripperReleaseAngleFast(GRIPPER_TURNTABLE_RELEASE_ANGLE);
       autoPhase = AutoPhase::TurntableWaitGripperOpen;
       autoPhaseStartMs = now;
       autoPhaseDurationMs = 0;
       break;
 
     case AutoPhase::TurntableWaitGripperOpen:
-      if (gripperMotionActive) {
-        autoPhaseStartMs = now;
-        autoPhaseDurationMs = GRIPPER_OPEN_UPDATE_MS;
-        break;
-      }
       Serial.printf("AUTO_STEP: move M5 to top pos %ld\n", (long)M5_TOP_MOTOR5);
       setMotorAbsPosition(4, M5_TOP_MOTOR5, POSITION_SPEED_M5_AUTO);
       autoPhase = AutoPhase::TurntableMoveTopAfterOpen;
@@ -897,31 +828,39 @@ void updateAutoStateMachine() {
       break;
 
     case AutoPhase::TurntableMoveTopAfterOpen:
+      Serial.println("AUTO_STEP: open gripper fully");
+      setGripperStateFast(GRIPPER_STATE_OPEN);
+      autoPhase = AutoPhase::TurntableStepTray;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = 0;
+      break;
+
+    case AutoPhase::TurntableStepTray:
       Serial.printf("AUTO_STEP: step M6 tray to %ld\n", (long)(motor6Pos + AUTO_TURNTABLE_M6_STEP));
       setMotorAbsPosition(5, motor6Pos + AUTO_TURNTABLE_M6_STEP);
-      autoPhase = AutoPhase::TurntableStepTray;
+      autoPhase = AutoPhase::TurntableRotatePreClamp;
       autoPhaseStartMs = now;
       autoPhaseDurationMs = AUTO_M6_STEP_WAIT_MS;
       break;
 
-    case AutoPhase::TurntableStepTray:
+    case AutoPhase::TurntableRotatePreClamp:
       Serial.println("AUTO_STEP: rotate S1 to pre-clamp and push S4 to limit");
       setServoAngle(1, PRE_CLAMP_SERVO0);
       setServoAngle(4, PRE_DROP_SERVO3);
-      autoPhase = AutoPhase::TurntableRotatePreClamp;
+      autoPhase = AutoPhase::TurntableMovePreClamp;
       autoPhaseStartMs = now;
       autoPhaseDurationMs = AUTO_SERVO_SETTLE_MS;
       break;
 
-    case AutoPhase::TurntableRotatePreClamp:
+    case AutoPhase::TurntableMovePreClamp:
       Serial.printf("AUTO_STEP: move M5 to pre-clamp pos %ld\n", (long)PRE_CLAMP_MOTOR5);
       setMotorAbsPosition(4, PRE_CLAMP_MOTOR5, POSITION_SPEED_M5_AUTO);
-      autoPhase = AutoPhase::TurntableMovePreClamp;
+      autoPhase = AutoPhase::TurntableFinishPreClamp;
       autoPhaseStartMs = now;
       autoPhaseDurationMs = estimateMotor5MoveTime(M5_TOP_MOTOR5, PRE_CLAMP_MOTOR5);
       break;
 
-    case AutoPhase::TurntableMovePreClamp:
+    case AutoPhase::TurntableFinishPreClamp:
       currentAutoState = 1;
       autoRunning = false;
       autoPhase = AutoPhase::Idle;
@@ -937,16 +876,11 @@ void updateAutoStateMachine() {
       break;
 
     case AutoPhase::PreDropWaitGripperOpen:
-      if (gripperMotionActive) {
-        autoPhaseStartMs = now;
-        autoPhaseDurationMs = GRIPPER_OPEN_UPDATE_MS;
-        break;
-      }
       Serial.printf("AUTO_STEP: set S4 inward to turntable angle %d\n", TURNTABLE_SERVO3);
       setServoAngle(4, TURNTABLE_SERVO3);
       autoPhase = AutoPhase::PreDropSetS4ToTurntable;
       autoPhaseStartMs = now;
-      autoPhaseDurationMs = AUTO_SERVO_SETTLE_MS;
+      autoPhaseDurationMs = PRE_DROP_S4_TO_TURNTABLE_SETTLE_MS;
       break;
 
     case AutoPhase::PreDropSetS4ToTurntable:
@@ -974,11 +908,6 @@ void updateAutoStateMachine() {
       break;
 
     case AutoPhase::PreDropWaitGripperClose:
-      if (gripperMotionActive) {
-        autoPhaseStartMs = now;
-        autoPhaseDurationMs = GRIPPER_CLOSE_UPDATE_MS;
-        break;
-      }
       Serial.println("AUTO_STEP: wait after close gripper");
       autoPhase = AutoPhase::PreDropWaitAfterClose;
       autoPhaseStartMs = now;
@@ -1002,6 +931,14 @@ void updateAutoStateMachine() {
       break;
 
     case AutoPhase::PreDropSetS1ToDrop:
+      Serial.printf("AUTO_STEP: reverse M6 tray to %ld\n", (long)(motor6Pos - AUTO_TURNTABLE_M6_STEP));
+      setMotorAbsPosition(5, motor6Pos - AUTO_TURNTABLE_M6_STEP);
+      autoPhase = AutoPhase::PreDropReverseTray;
+      autoPhaseStartMs = now;
+      autoPhaseDurationMs = AUTO_M6_STEP_WAIT_MS;
+      break;
+
+    case AutoPhase::PreDropReverseTray:
       Serial.printf("AUTO_STEP: set S4 outward to pre-drop angle %d\n", PRE_DROP_SERVO3);
       setServoAngle(4, PRE_DROP_SERVO3);
       autoPhase = AutoPhase::PreDropSetS4ToDrop;
@@ -1018,25 +955,6 @@ void updateAutoStateMachine() {
       break;
 
     case AutoPhase::PreDropMoveToDrop:
-      Serial.println("AUTO_STEP: slow open gripper at pre-drop");
-      setGripperStateSlow(GRIPPER_STATE_OPEN);
-      autoPhase = AutoPhase::PreDropOpenAtDrop;
-      autoPhaseStartMs = now;
-      autoPhaseDurationMs = 0;
-      break;
-
-    case AutoPhase::PreDropOpenAtDrop:
-      if (gripperMotionActive) {
-        autoPhaseStartMs = now;
-        autoPhaseDurationMs = GRIPPER_OPEN_UPDATE_MS;
-        break;
-      }
-      autoPhase = AutoPhase::PreDropWaitOpenAtDrop;
-      autoPhaseStartMs = now;
-      autoPhaseDurationMs = 0;
-      break;
-
-    case AutoPhase::PreDropWaitOpenAtDrop:
       currentAutoState = 3;
       autoRunning = false;
       autoPhase = AutoPhase::Idle;
